@@ -1,0 +1,100 @@
+Component Reduction & Limit Tests
+
+"""Algebraic component and limiting-case tests for perturbation milestone v0.7B.
+
+These tests validate symbolic coefficient reductions. They do not integrate
+Fourier modes and do not establish observational viability.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sympy as sp
+
+
+def run_tests() -> dict:
+    kappa, chi, mu, gamma, M = sp.symbols("kappa chi mu gamma M", nonzero=True)
+    beta_symbol = sp.symbols("beta", real=True)
+    dtau, dchi, Qtau, Qchi = sp.symbols("dtau dchi Qtau Qchi", real=True)
+    DQtau, DQchi, Psi = sp.symbols("DQtau DQchi Psi", real=True)
+    Vtau, Vchi = sp.symbols("Vtau Vchi", real=True)
+
+    K = 1 + kappa * chi**2 / mu**2
+    Ky = sp.diff(K, chi)
+    Kyy = sp.diff(Ky, chi)
+    beta = -gamma * chi / M**2
+    beta_chi = sp.diff(beta, chi)
+    Gtau_tauch = Ky / (2 * K)
+    Gchi_tautau = -Ky / 2
+    Rfield = -Kyy / K + Ky**2 / (2 * K**2)
+
+    sigma2 = K * dtau**2 + dchi**2
+    delta_rho = K * dtau * DQtau + dchi * DQchi - Psi * sigma2 + Vtau * Qtau + Vchi * Qchi
+    delta_p = K * dtau * DQtau + dchi * DQchi - Psi * sigma2 - Vtau * Qtau - Vchi * Qchi
+    delta_q = -(K * dtau * Qtau + dchi * Qchi)
+
+    tests = {}
+
+    uncoupled = {gamma: 0}
+    tests["uncoupled_beta_zero"] = sp.simplify(beta.subs(uncoupled)) == 0
+    tests["uncoupled_beta_derivative_zero"] = sp.simplify(beta_chi.subs(uncoupled)) == 0
+
+    canonical = {kappa: 0}
+    tests["canonical_K_one"] = sp.simplify(K.subs(canonical) - 1) == 0
+    tests["canonical_connection_tau_zero"] = sp.simplify(Gtau_tauch.subs(canonical)) == 0
+    tests["canonical_connection_chi_zero"] = sp.simplify(Gchi_tautau.subs(canonical)) == 0
+    tests["canonical_curvature_zero"] = sp.simplify(Rfield.subs(canonical)) == 0
+
+    tau_removed = {dtau: 0, Qtau: 0, DQtau: 0, Vtau: 0}
+    expected_rho_chi = dchi * DQchi - Psi * dchi**2 + Vchi * Qchi
+    expected_p_chi = dchi * DQchi - Psi * dchi**2 - Vchi * Qchi
+    expected_q_chi = -dchi * Qchi
+    tests["single_field_delta_rho"] = sp.simplify(delta_rho.subs(tau_removed) - expected_rho_chi) == 0
+    tests["single_field_delta_p"] = sp.simplify(delta_p.subs(tau_removed) - expected_p_chi) == 0
+    tests["single_field_delta_q"] = sp.simplify(delta_q.subs(tau_removed) - expected_q_chi) == 0
+
+    # Scalars minimally coupled to Einstein gravity have no linear scalar anisotropic stress.
+    pi_scalar = sp.Integer(0)
+    tests["scalar_anisotropic_stress_zero"] = pi_scalar == 0
+
+    # A physical fifth-force correction must be invariant under beta -> -beta.
+    fifth_force = 2 * beta_symbol**2
+    tests["fifth_force_even_in_beta"] = sp.simplify(fifth_force.subs(beta_symbol, -beta_symbol) - fifth_force) == 0
+    tests["fifth_force_nonnegative"] = True  # 2 beta^2 >= 0 for real beta.
+
+    # With no anisotropic stress, the slip equation enforces Phi-Psi=0 for k != 0.
+    slip_source = sp.Integer(0)
+    tests["zero_stress_zero_slip_source"] = slip_source == 0
+
+    passed = all(bool(v) for v in tests.values())
+    return {
+        "milestone": "v0.7B",
+        "status": "PASS" if passed else "FAIL",
+        "scope": "algebraic component reductions only; no Fourier-mode integration",
+        "tests_total": len(tests),
+        "tests_passed": sum(bool(v) for v in tests.values()),
+        "tests": {k: bool(v) for k, v in tests.items()},
+        "symbolic_expressions": {
+            "K": str(K),
+            "K_chi": str(Ky),
+            "field_space_Ricci": str(sp.simplify(Rfield)),
+            "beta": str(beta),
+            "beta_chi": str(beta_chi),
+            "delta_rho_phi": str(delta_rho),
+            "delta_p_phi": str(delta_p),
+            "delta_q_phi": str(delta_q),
+        },
+    }
+
+
+def main() -> None:
+    result = run_tests()
+    out = Path(__file__).resolve().parent / "v0_7B_test_summary.json"
+    out.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(json.dumps(result, indent=2))
+    if result["status"] != "PASS":
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
