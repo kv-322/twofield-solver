@@ -1,0 +1,821 @@
+v0.3: Optimized Reference Background Solver
+
+"""
+Numerical Validation Protocol for Two-Field Scalar-Tensor Background Solver
+Version 0.3 — Optimized Reference Benchmark
+Status: Implementation complete; ready for execution and empirical evaluation
+"""
+
+from datetime import datetime
+import warnings
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp
+
+H0_PHYSICAL = 67.3  # km/s/Mpc
+
+BASELINE = {
+    "m_tau_tilde": 0.1,
+    "m_chi_tilde": 1e-3,
+    "kappa": 0.1,
+    "gamma_chi": 0.05,
+    "mu_star_tilde": 1.0,
+    "M_chi_tilde": 1.0,
+    "Omega_m0_target": 0.3,
+    "Omega_r0_target": 8.4e-5,
+    "Lambda_tilde": 0.699916,  # Approximately normalized
+    "x0": -0.02,
+    "x_dot0": 1e-4,
+    "y0": 0.01,
+    "y_dot0": 1e-6,
+}
+
+
+def ode_system(N, Y, params):
+    """Coupled FLRW ODE system for the two-field scalar-tensor model."""
+    x, x_dot, y, y_dot, rho_m, rho_r = Y
+    p = params
+
+    K = 1.0 + p["kappa"] * y**2 / p["mu_star_tilde"]**2
+    K_y = 2.0 * p["kappa"] * y / p["mu_star_tilde"]**2
+    V = (
+        p["m_tau_tilde"]**2 * x**2 / 6.0
+        + p["m_chi_tilde"]**2 * y**2 / 6.0
+    )
+
+    denom = 1.0 - (K * x_dot**2 + y_dot**2) / 6.0
+    if denom <= 0.0:
+        raise FloatingPointError(
+            f"Friedmann denominator became nonpositive at N={N:.16e}"
+        )
+
+    H2 = (rho_m + rho_r + V + p["Lambda_tilde"]) / denom
+    if H2 <= 0.0:
+        raise FloatingPointError(f"H^2 became nonpositive at N={N:.16e}")
+
+    rho_tau = H2 * K * x_dot**2 / 6.0 + p["m_tau_tilde"]**2 * x**2 / 6.0
+    p_tau = H2 * K * x_dot**2 / 6.0 - p["m_tau_tilde"]**2 * x**2 / 6.0
+    rho_chi = H2 * y_dot**2 / 6.0 + p["m_chi_tilde"]**2 * y**2 / 6.0
+    p_chi = H2 * y_dot**2 / 6.0 - p["m_chi_tilde"]**2 * y**2 / 6.0
+
+    H_N_over_H = -(3.0 / (2.0 * H2)) * (
+        rho_m + 4.0 * rho_r / 3.0 + rho_tau + p_tau + rho_chi + p_chi
+    )
+
+    alpha_chi = p["gamma_chi"] * y / p["M_chi_tilde"]**2
+    T = -rho_m
+
+    dx = x_dot
+    dx_dot = -(
+        3.0 + H_N_over_H + (K_y / K) * y_dot
+    ) * x_dot - p["m_tau_tilde"]**2 * x / (K * H2)
+    dy = y_dot
+    dy_dot = -(
+        3.0 + H_N_over_H
+    ) * y_dot - p["m_chi_tilde"]**2 * y / H2 + 0.5 * K_y * x_dot**2 + 3.0 * alpha_chi * T / H2
+    drho_m = -3.0 * rho_m + alpha_chi * y_dot * rho_m
+    drho_r = -4.0 * rho_r
+
+    return [dx, dx_dot, dy, dy_dot, drho_m, drho_r]
+
+
+def make_clock_event(_params):
+    """Create the x_,N = 0 event."""
+    def event(_N, Y):
+        return Y[1]
+
+    event.terminal = False
+    event.direction = 0
+    return event
+
+
+def run_simulation(
+    params,
+    solver="RK45",
+    rtol=1e-12,
+    atol=1e-14,
+    max_step=0.01,
+    N_i=None,
+    N_f=0.0,
+    dense_output=True,
+    t_eval=None,
+    detect_clock_events=True,
+):
+    """Run one background integration."""
+    if N_i is None:
+        N_i = np.log(1e-6)
+
+    rho_m_i = params.get("Omega_m0_target", 0.3) * np.exp(-3.0 * N_i)
+    rho_r_i = params.get("Omega_r0_target", 8.4e-5) * np.exp(-4.0 * N_i)
+    Y0 = [
+        params["x0"],
+        params["x_dot0"],
+        params["y0"],
+        params["y_dot0"],
+        rho_m_i,
+        rho_r_i,
+    ]
+
+    events = make_clock_event(params) if detect_clock_events else None
+    sol = solve_ivp(
+        lambda N, Y: ode_system(N, Y, params),
+        (N_i, N_f),
+        Y0,
+        method=solver,
+        rtol=rtol,
+        atol=atol,
+        max_step=max_step,
+        dense_output=dense_output,
+        t_eval=t_eval,
+        events=events,
+    )
+    return sol if sol.success else None
+
+
+def _background_quantities(Y, params):
+    """Return H^2, densities, pressures, and Q_acc for one state vector."""
+    x, x_dot, y, y_dot, rho_m, rho_r = Y
+    K = 1.0 + params["kappa"] * y**2 / params["mu_star_tilde"]**2
+    V = (
+        params["m_tau_tilde"]**2 * x**2 / 6.0
+        + params["m_chi_tilde"]**2 * y**2 / 6.0
+    )
+    denom = 1.0 - (K * x_dot**2 + y_dot**2) / 6.0
+    if denom <= 0.0:
+        return None
+    H2 = (rho_m + rho_r + V + params["Lambda_tilde"]) / denom
+    if H2 <= 0.0:
+        return None
+
+    rho_tau = H2 * K * x_dot**2 / 6.0 + params["m_tau_tilde"]**2 * x**2 / 6.0
+    p_tau = H2 * K * x_dot**2 / 6.0 - params["m_tau_tilde"]**2 * x**2 / 6.0
+    rho_chi = H2 * y_dot**2 / 6.0 + params["m_chi_tilde"]**2 * y**2 / 6.0
+    p_chi = H2 * y_dot**2 / 6.0 - params["m_chi_tilde"]**2 * y**2 / 6.0
+    rho_tot = rho_m + rho_r + rho_tau + rho_chi + params["Lambda_tilde"]
+    Q_acc = -(3.0 / (2.0 * H2)) * (
+        rho_m + 4.0 * rho_r / 3.0 + rho_tau + p_tau + rho_chi + p_chi
+    )
+    return H2, rho_tau, p_tau, rho_chi, p_chi, rho_tot, Q_acc
+
+
+def extract_results(sol, params, N_grid=None):
+    """Evaluate a solution and compute cosmological diagnostics."""
+    if sol.sol is not None:
+        if N_grid is None:
+            N_grid = np.linspace(sol.t[0], sol.t[-1], 10000)
+        Y_grid = sol.sol(N_grid)
+    elif hasattr(sol, "t") and hasattr(sol, "y"):
+        N_grid = sol.t
+        Y_grid = sol.y
+    else:
+        raise ValueError("No dense solution or evaluated grid is available.")
+
+    x, x_dot, y, y_dot, rho_m, rho_r = Y_grid
+    z = np.exp(-N_grid) - 1.0
+    n = len(N_grid)
+
+    H2_grid = np.full(n, np.nan)
+    Omega_m = np.full(n, np.nan)
+    Omega_r = np.full(n, np.nan)
+    Omega_tau = np.full(n, np.nan)
+    Omega_chi = np.full(n, np.nan)
+    Omega_Lambda = np.full(n, np.nan)
+    Q_acc = np.full(n, np.nan)
+
+    for i in range(n):
+        quantities = _background_quantities(Y_grid[:, i], params)
+        if quantities is None:
+            continue
+        H2, rho_tau, _p_tau, rho_chi, _p_chi, rho_tot, q_acc = quantities
+        H2_grid[i] = H2
+        Omega_m[i] = rho_m[i] / rho_tot
+        Omega_r[i] = rho_r[i] / rho_tot
+        Omega_tau[i] = rho_tau / rho_tot
+        Omega_chi[i] = rho_chi / rho_tot
+        Omega_Lambda[i] = params["Lambda_tilde"] / rho_tot
+        Q_acc[i] = q_acc
+
+    H = np.full(n, np.nan)
+    valid_h2 = np.isfinite(H2_grid) & (H2_grid > 0.0)
+    H[valid_h2] = np.sqrt(H2_grid[valid_h2])
+
+    Q_num = np.full(n, np.nan)
+    valid_h = np.isfinite(H) & (H > 0.0)
+    if valid_h.sum() > 1:
+        Q_num[valid_h] = np.gradient(np.log(H[valid_h]), N_grid[valid_h])
+
+    eps_H = np.full(n, np.nan)
+    valid_cons = np.isfinite(Q_num) & np.isfinite(Q_acc)
+    eps_H[valid_cons] = np.abs(Q_num[valid_cons] - Q_acc[valid_cons]) / (
+        1.0 + np.abs(Q_acc[valid_cons])
+    )
+    w_eff = -1.0 - 2.0 * Q_acc / 3.0
+    idx0 = int(np.argmin(np.abs(N_grid)))
+    clock_derivative = H * x_dot
+
+    if np.any(np.isfinite(clock_derivative)):
+        idx_min = int(np.nanargmin(clock_derivative))
+        min_info = {
+            "N": N_grid[idx_min],
+            "z": z[idx_min],
+            "x_dot": x_dot[idx_min],
+            "H_x_dot": clock_derivative[idx_min],
+            "H": H[idx_min],
+            "idx": idx_min,
+        }
+    else:
+        idx_min = None
+        min_info = None
+
+    if getattr(sol, "t_events", None) is not None and len(sol.t_events) > 0:
+        zero_crossings = len(sol.t_events[0])
+    else:
+        zero_crossings = 0
+
+    return {
+        "N": N_grid,
+        "z": z,
+        "x": x,
+        "x_dot": x_dot,
+        "y": y,
+        "y_dot": y_dot,
+        "rho_m": rho_m,
+        "rho_r": rho_r,
+        "H": H,
+        "H2": H2_grid,
+        "H_N_over_H_acc": Q_acc,
+        "H_N_over_H_num": Q_num,
+        "eps_H": eps_H,
+        "Omega_m": Omega_m,
+        "Omega_r": Omega_r,
+        "Omega_tau": Omega_tau,
+        "Omega_chi": Omega_chi,
+        "Omega_Lambda": Omega_Lambda,
+        "w_eff": w_eff,
+        "clock_derivative": clock_derivative,
+        "min_info": min_info,
+        "idx_min": idx_min,
+        "idx0": idx0,
+        "present_day": {
+            "H_dimless": H[idx0],
+            "H_physical": H[idx0] * H0_PHYSICAL,
+            "Omega_m0": Omega_m[idx0],
+            "Omega_r0": Omega_r[idx0],
+            "Omega_tau0": Omega_tau[idx0],
+            "Omega_chi0": Omega_chi[idx0],
+            "Omega_Lambda0": Omega_Lambda[idx0],
+            "w_eff0": w_eff[idx0],
+        },
+        "zero_crossings": zero_crossings,
+        "sol": sol,
+    }
+
+
+def compute_clock_tolerance(x_dot, H, idx_min, atol=1e-14, rtol=1e-12, C=10.0):
+    """Compute the local numerical clock tolerance."""
+    scale_xdot = np.nanmax(np.abs(x_dot))
+    eps_xdot = C * (atol + rtol * scale_xdot)
+    if idx_min is not None and np.isfinite(H[idx_min]):
+        return abs(H[idx_min]) * eps_xdot
+    return np.nanmedian(np.abs(H)) * eps_xdot
+
+
+def classify_clock(min_val, zero_crossings, eps_clock):
+    """Classify clock monotonicity using a supplied tolerance."""
+    if min_val > eps_clock and zero_crossings == 0:
+        return "STRICTLY MONOTONIC INCREASING"
+    if zero_crossings > 0 and min_val < -eps_clock:
+        return "NONMONOTONIC"
+    if min_val < -eps_clock and zero_crossings == 0:
+        return "SIGN-EVENT INCONSISTENCY — UNRESOLVED"
+    if abs(min_val) <= eps_clock:
+        return "NEAR-STATIONARY — UNRESOLVED"
+    return "UNCLASSIFIED"
+
+
+def test_interpolation(params):
+    """Compare raw nodes, dense output, t_eval output, and a reference run."""
+    sol = run_simulation(params, "RK45", 1e-12, 1e-14, 0.01, dense_output=True)
+    if sol is None:
+        return None
+
+    raw_N = sol.t
+    raw_x_dot = sol.y[1]
+    raw_H = np.full_like(raw_N, np.nan)
+    for i in range(len(raw_N)):
+        quantities = _background_quantities(sol.y[:, i], params)
+        if quantities is not None:
+            raw_H[i] = np.sqrt(quantities[0])
+    raw_clock = raw_H * raw_x_dot
+
+    dense_at_raw = sol.sol(raw_N)[1]
+    dense_clock = raw_H * dense_at_raw
+
+    sol_direct = run_simulation(
+        params, "RK45", 1e-12, 1e-14, 0.01,
+        dense_output=False, t_eval=raw_N
+    )
+    direct_clock = None
+    if sol_direct is not None:
+        direct_H = np.full_like(raw_N, np.nan)
+        for i in range(len(raw_N)):
+            quantities = _background_quantities(sol_direct.y[:, i], params)
+            if quantities is not None:
+                direct_H[i] = np.sqrt(quantities[0])
+        direct_clock = direct_H * sol_direct.y[1]
+
+    sol_ref = run_simulation(
+        params, "DOP853", 1e-13, 1e-15, 0.001, dense_output=True
+    )
+    ref_clock = None
+    if sol_ref is not None:
+        Y_ref = sol_ref.sol(raw_N)
+        ref_H = np.full_like(raw_N, np.nan)
+        for i in range(len(raw_N)):
+            quantities = _background_quantities(Y_ref[:, i], params)
+            if quantities is not None:
+                ref_H[i] = np.sqrt(quantities[0])
+        ref_clock = ref_H * Y_ref[1]
+
+    return {
+        "raw": {
+            "N": raw_N,
+            "x_dot": raw_x_dot,
+            "H": raw_H,
+            "Hx_dot": raw_clock,
+            "min_Hxdot": np.nanmin(raw_clock),
+        },
+        "dense_at_raw": {
+            "x_dot": dense_at_raw,
+            "Hx_dot": dense_clock,
+            "min_Hxdot": np.nanmin(dense_clock),
+            "interp_error_xdot": np.nanmax(np.abs(dense_at_raw - raw_x_dot)),
+            "interp_error_Hxdot": np.nanmax(np.abs(dense_clock - raw_clock)),
+        },
+        "direct": None if direct_clock is None else {
+            "Hx_dot": direct_clock,
+            "min_Hxdot": np.nanmin(direct_clock),
+        },
+        "reference": None if ref_clock is None else {
+            "Hx_dot": ref_clock,
+            "min_Hxdot": np.nanmin(ref_clock),
+        },
+    }
+
+
+def analyze_consistency(res, edge=10):
+    """Summarize the acceleration-vs-numerical H derivative diagnostic."""
+    valid = np.isfinite(res["eps_H"]) & np.isfinite(res["H"])
+    if not np.any(valid):
+        return None
+    eps_H = res["eps_H"][valid]
+    N = res["N"][valid]
+    if len(eps_H) > 2 * edge:
+        eps_H_interior = eps_H[edge:-edge]
+        N_interior = N[edge:-edge]
+    else:
+        eps_H_interior = eps_H
+        N_interior = N
+    return {
+        "N": N,
+        "N_interior": N_interior,
+        "eps_H": eps_H,
+        "eps_H_interior": eps_H_interior,
+        "max_eps_H": np.nanmax(eps_H),
+        "max_eps_H_interior": np.nanmax(eps_H_interior),
+        "mean_eps_H_interior": np.nanmean(eps_H_interior),
+        "rms_eps_H_interior": np.sqrt(np.nanmean(eps_H_interior**2)),
+        "median_eps_H_interior": np.nanmedian(eps_H_interior),
+    }
+
+
+def test_lambdacdm_limit():
+    """Test the exact LambdaCDM invariant subspace."""
+    exact = BASELINE.copy()
+    exact.update({
+        "x0": 0.0,
+        "x_dot0": 0.0,
+        "y0": 0.0,
+        "y_dot0": 0.0,
+        "kappa": 0.0,
+        "gamma_chi": 0.0,
+    })
+    sol = run_simulation(
+        exact, "RK45", 1e-12, 1e-14, 0.01, detect_clock_events=False
+    )
+    if sol is None:
+        return None
+    res = extract_results(sol, exact)
+
+    field_zero_error = max(
+        np.nanmax(np.abs(res["x"])),
+        np.nanmax(np.abs(res["x_dot"])),
+        np.nanmax(np.abs(res["y"])),
+        np.nanmax(np.abs(res["y_dot"])),
+    )
+    field_zero_pass = field_zero_error < 1e-14
+
+    z = res["z"]
+    Om = exact["Omega_m0_target"]
+    Or = exact["Omega_r0_target"]
+    OL = 1.0 - Om - Or
+    H_LCDM = np.sqrt(Om * (1.0 + z)**3 + Or * (1.0 + z)**4 + OL)
+    H0_dev = abs(res["present_day"]["H_dimless"] - 1.0)
+    H_model_norm = res["H"] / res["present_day"]["H_dimless"]
+    E_LCDM = H_LCDM / H_LCDM[res["idx0"]]
+    shape_deviation = np.abs(H_model_norm - E_LCDM) / E_LCDM
+    w_expected = Or / 3.0 - OL
+
+    Om_dev = abs(res["present_day"]["Omega_m0"] - Om)
+    OL_dev = abs(res["present_day"]["Omega_Lambda0"] - OL)
+    w_dev = abs(res["present_day"]["w_eff0"] - w_expected)
+
+    flags = {
+        "H0_pass": H0_dev < 1e-6,
+        "shape_pass": np.nanmax(shape_deviation) < 1e-8,
+        "Omega_m0_pass": Om_dev < 1e-6,
+        "Omega_Lambda0_pass": OL_dev < 1e-6,
+        "w_eff0_pass": w_dev < 1e-6,
+        "field_zero_pass": field_zero_pass,
+    }
+    return {
+        "res": res,
+        "H_LCDM": H_LCDM,
+        "H_model_norm": H_model_norm,
+        "E_LCDM": E_LCDM,
+        "max_shape_deviation": np.nanmax(shape_deviation),
+        "mean_shape_deviation": np.nanmean(shape_deviation),
+        "H0_abs_deviation": H0_dev,
+        "w_eff_expected": w_expected,
+        "Omega_m0_deviation": Om_dev,
+        "Omega_Lambda0_deviation": OL_dev,
+        "w_eff0_deviation": w_dev,
+        "field_zero_error": field_zero_error,
+        **flags,
+        "overall_lcdm_pass": all(flags.values()),
+    }
+
+
+def test_diagnostic_grid_sampling(params):
+    """Assess convergence of diagnostics under denser output-grid sampling."""
+    grid_sizes = [5000, 10000, 20000, 40000]
+    sol = run_simulation(params, "RK45", 1e-12, 1e-14, 0.01, dense_output=True)
+    if sol is None:
+        return pd.DataFrame([
+            {"n_points": n, "success": False} for n in grid_sizes
+        ])
+
+    rows = []
+    for n_points in grid_sizes:
+        N_grid = np.linspace(sol.t[0], sol.t[-1], n_points)
+        consistency = analyze_consistency(extract_results(sol, params, N_grid))
+        if consistency is None:
+            rows.append({"n_points": n_points, "success": False})
+        else:
+            rows.append({
+                "n_points": n_points,
+                "success": True,
+                "max_eps_H_interior": consistency["max_eps_H_interior"],
+                "rms_eps_H_interior": consistency["rms_eps_H_interior"],
+                "mean_eps_H_interior": consistency["mean_eps_H_interior"],
+            })
+    df = pd.DataFrame(rows)
+    if df["success"].all():
+        df["max_decreasing"] = df["max_eps_H_interior"].diff().fillna(0) <= 0
+        df["rms_decreasing"] = df["rms_eps_H_interior"].diff().fillna(0) <= 0
+        overall = (
+            df["max_eps_H_interior"].iloc[-1] < df["max_eps_H_interior"].iloc[0]
+            and df["rms_eps_H_interior"].iloc[-1] < df["rms_eps_H_interior"].iloc[0]
+        )
+        df["trend_pass"] = overall
+    else:
+        df["max_decreasing"] = False
+        df["rms_decreasing"] = False
+        df["trend_pass"] = False
+    return df
+
+
+def test_solver_convergence(params):
+    """Run the B1-B11 convergence matrix."""
+    configs = [
+        ("B1", "RK45", 1e-8, 1e-10, 0.01),
+        ("B2", "RK45", 1e-10, 1e-12, 0.01),
+        ("B3", "RK45", 1e-12, 1e-14, 0.01),
+        ("B4", "RK45", 1e-13, 1e-15, 0.01),
+        ("B5", "RK45", 1e-12, 1e-14, 0.001),
+        ("B6", "RK45", 1e-12, 1e-14, 0.0001),
+        ("B7", "DOP853", 1e-12, 1e-14, 0.01),
+        ("B8", "DOP853", 1e-13, 1e-15, 0.01),
+        ("B9", "Radau", 1e-12, 1e-14, 0.01),
+        ("B10", "Radau", 1e-13, 1e-15, 0.01),
+        ("B11", "DOP853", 1e-13, 1e-15, 0.001),
+    ]
+    rows = []
+    for test_id, solver, rtol, atol, max_step in configs:
+        print(f"Running {test_id}: {solver}, rtol={rtol}, atol={atol}, max_step={max_step}")
+        warning_text = ""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                sol = run_simulation(params, solver, rtol, atol, max_step)
+                warning_text = " | ".join(str(w.message) for w in caught)
+            except Exception as exc:  # noqa: BLE001
+                sol = None
+                warning_text = str(exc)
+        if sol is None:
+            rows.append({
+                "test_id": test_id, "solver": solver, "rtol": rtol,
+                "atol": atol, "max_step": max_step, "success": False,
+                "steps": 0, "warnings": warning_text or "Solver returned None",
+            })
+            continue
+
+        res = extract_results(sol, params)
+        min_val = res["min_info"]["H_x_dot"] if res["min_info"] else np.nan
+        eps_clock = compute_clock_tolerance(
+            res["x_dot"], res["H"], res["idx_min"], atol, rtol
+        )
+        consistency = analyze_consistency(res)
+        rows.append({
+            "test_id": test_id,
+            "solver": solver,
+            "rtol": rtol,
+            "atol": atol,
+            "max_step": max_step,
+            "success": True,
+            "steps": len(sol.t),
+            "events": res["zero_crossings"],
+            "min_Hxdot": min_val,
+            "min_xdot": res["min_info"]["x_dot"],
+            "min_N": res["min_info"]["N"],
+            "min_z": res["min_info"]["z"],
+            "H0": res["present_day"]["H_dimless"],
+            "Omega_m0": res["present_day"]["Omega_m0"],
+            "Omega_Lambda0": res["present_day"]["Omega_Lambda0"],
+            "w_eff0": res["present_day"]["w_eff0"],
+            "max_eps_H_interior": (
+                consistency["max_eps_H_interior"] if consistency else np.nan
+            ),
+            "classification": classify_clock(
+                min_val, res["zero_crossings"], eps_clock
+            ),
+            "eps_clock": eps_clock,
+            "warnings": warning_text or None,
+        })
+
+    df = pd.DataFrame(rows)
+    if "B11" not in df.get("test_id", pd.Series(dtype=str)).values:
+        return df
+    ref = df.loc[df["test_id"] == "B11"].iloc[0]
+    if not bool(ref["success"]):
+        return df
+
+    df["delta_min_Hxdot"] = np.abs(df["min_Hxdot"] - ref["min_Hxdot"])
+    df["clock_difference_pass"] = df["delta_min_Hxdot"] < 1e-12
+    df["event_agreement_pass"] = df["events"] == ref["events"]
+    df["H0_stability_pass"] = np.abs(df["H0"] - ref["H0"]) < 1e-4
+    df["Omega_m0_stability_pass"] = np.abs(df["Omega_m0"] - ref["Omega_m0"]) < 1e-4
+    df["convergence_pass"] = (
+        df["success"]
+        & df["clock_difference_pass"]
+        & df["event_agreement_pass"]
+        & df["H0_stability_pass"]
+        & df["Omega_m0_stability_pass"]
+    )
+
+    valid_all = df["success"] & np.isfinite(df["min_Hxdot"])
+    full_spread = df.loc[valid_all, "delta_min_Hxdot"].max()
+    empirical_ids = ["B8", "B10", "B11"]
+    valid_emp = (
+        df["test_id"].isin(empirical_ids)
+        & df["success"]
+        & np.isfinite(df["min_Hxdot"])
+    )
+    df.attrs["full_solver_spread"] = full_spread
+    if valid_emp.sum() == len(empirical_ids):
+        empirical_spread = df.loc[valid_emp, "delta_min_Hxdot"].max()
+        eps_emp = 10.0 * empirical_spread
+        events_agree = bool(df.loc[valid_emp, "event_agreement_pass"].all())
+        ref_min = ref["min_Hxdot"]
+        ref_events = ref["events"]
+        if not events_agree:
+            final_class = "SOLVER-DEPENDENT — UNRESOLVED"
+        elif ref_min > eps_emp and ref_events == 0:
+            final_class = "STRICTLY MONOTONIC INCREASING"
+        elif ref_min < -eps_emp and ref_events > 0:
+            final_class = "NONMONOTONIC"
+        elif ref_min < -eps_emp and ref_events == 0:
+            final_class = "SIGN-EVENT INCONSISTENCY — UNRESOLVED"
+        else:
+            final_class = "NEAR-STATIONARY — UNRESOLVED"
+        df.attrs.update({
+            "empirical_spread": empirical_spread,
+            "eps_clock_emp": eps_emp,
+            "events_agree": events_agree,
+            "final_clock_classification": final_class,
+            "solvers_included": empirical_ids,
+        })
+    else:
+        df.attrs.update({
+            "empirical_spread": np.nan,
+            "eps_clock_emp": np.nan,
+            "events_agree": False,
+            "final_clock_classification": "INSUFFICIENT HIGH-ACCURACY RUNS — UNRESOLVED",
+            "solvers_included": list(df.loc[valid_emp, "test_id"].values),
+        })
+    return df
+
+
+
+def _save_figure_safely(fig, output_file):
+    """Save a diagnostic figure without allowing layout issues to abort validation."""
+    try:
+        fig.tight_layout()
+    except Exception as exc:
+        warnings.warn(f"tight_layout failed for {output_file}: {exc}")
+    try:
+        fig.savefig(output_file, dpi=300, bbox_inches="tight")
+    except Exception as exc:
+        warnings.warn(f"bbox_inches save failed for {output_file}: {exc}; retrying basic save")
+        fig.savefig(output_file, dpi=300)
+    finally:
+        plt.close(fig)
+
+
+def plot_clock_derivative(res, output_file="clock_derivative.png"):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    axes[0].plot(res["z"], res["clock_derivative"], linewidth=1.5)
+    axes[0].axhline(0.0, linestyle="--", linewidth=0.8)
+    axes[0].set_xlim(res["z"].max(), 0.0)
+    axes[0].set_xlabel("Redshift z")
+    axes[0].set_ylabel(r"$\mathcal{H}x_{,N}$")
+    axes[0].set_title("Clock Derivative (Full Range)")
+    axes[0].grid(True, alpha=0.3)
+
+    mask = np.abs(res["clock_derivative"]) < 1e-8
+    if np.any(mask):
+        axes[1].plot(res["z"][mask], res["clock_derivative"][mask], linewidth=1.5)
+        axes[1].axhline(0.0, linestyle="--", linewidth=0.8)
+        axes[1].set_xlabel("Redshift z")
+        axes[1].set_ylabel(r"$\mathcal{H}x_{,N}$")
+        axes[1].set_title("Clock Derivative (Zoomed)")
+        axes[1].grid(True, alpha=0.3)
+    else:
+        axes[1].text(0.5, 0.5, "No points near zero", ha="center", va="center")
+    _save_figure_safely(fig, output_file)
+
+
+def plot_consistency(consistency, output_file="expansion_consistency.png"):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    z = np.exp(-consistency["N"]) - 1.0
+    axes[0].semilogy(z, consistency["eps_H"], linewidth=1.5)
+    axes[0].set_xlim(z.max(), 0.0)
+    axes[0].set_xlabel("Redshift z")
+    axes[0].set_ylabel(r"$\epsilon_H$")
+    axes[0].set_title("Expansion-Equation Consistency")
+    axes[0].grid(True, alpha=0.3)
+    axes[1].semilogy(consistency["N"], consistency["eps_H"], linewidth=1.5)
+    axes[1].set_xlabel("e-folds N")
+    axes[1].set_ylabel(r"$\epsilon_H$")
+    axes[1].set_title("Consistency vs N")
+    axes[1].grid(True, alpha=0.3)
+    _save_figure_safely(fig, output_file)
+
+
+def run_full_validation():
+    """Execute the complete Version 0.2 validation protocol."""
+    print("=" * 80)
+    print("NUMERICAL VALIDATION PROTOCOL")
+    print("Document Version: 0.2 — Executable Validation Draft")
+    print("Status: ready for execution and empirical evaluation")
+    print(f"Date: {datetime.now():%Y-%m-%d %H:%M:%S}")
+    print("=" * 80)
+
+    conv_df = test_solver_convergence(BASELINE)
+    conv_df.to_csv("solver_convergence.csv", index=False)
+    pd.DataFrame([{
+        "full_solver_spread": conv_df.attrs.get("full_solver_spread", np.nan),
+        "empirical_spread": conv_df.attrs.get("empirical_spread", np.nan),
+        "eps_clock_emp": conv_df.attrs.get("eps_clock_emp", np.nan),
+        "events_agree": conv_df.attrs.get("events_agree", False),
+        "final_clock_classification": conv_df.attrs.get(
+            "final_clock_classification", "UNAVAILABLE"
+        ),
+        "solvers_included": ",".join(conv_df.attrs.get("solvers_included", [])),
+    }]).to_csv("clock_classification_summary.csv", index=False)
+
+    interp = test_interpolation(BASELINE)
+    if interp is not None:
+        save_dict = {
+            "raw_N": interp["raw"]["N"],
+            "raw_Hx_dot": interp["raw"]["Hx_dot"],
+            "dense_Hx_dot": interp["dense_at_raw"]["Hx_dot"],
+            "interp_error_xdot": interp["dense_at_raw"]["interp_error_xdot"],
+            "interp_error_Hxdot": interp["dense_at_raw"]["interp_error_Hxdot"],
+        }
+        if interp["direct"] is not None:
+            save_dict["direct_Hx_dot"] = interp["direct"]["Hx_dot"]
+        if interp["reference"] is not None:
+            save_dict["ref_Hx_dot"] = interp["reference"]["Hx_dot"]
+        np.savez("interpolation_results.npz", **save_dict)
+        if interp["direct"] is not None and interp["reference"] is not None:
+            dense_diff = abs(
+                interp["dense_at_raw"]["min_Hxdot"]
+                - interp["reference"]["min_Hxdot"]
+            )
+            direct_diff = abs(
+                interp["direct"]["min_Hxdot"]
+                - interp["reference"]["min_Hxdot"]
+            )
+            pd.DataFrame([{
+                "dense_reference_difference": dense_diff,
+                "direct_reference_difference": direct_diff,
+                "interpolation_error_xdot": interp["dense_at_raw"]["interp_error_xdot"],
+                "interpolation_error_Hxdot": interp["dense_at_raw"]["interp_error_Hxdot"],
+                "dense_reference_pass": dense_diff < 1e-12,
+                "direct_reference_pass": direct_diff < 1e-12,
+                "xdot_interpolation_pass": interp["dense_at_raw"]["interp_error_xdot"] < 1e-14,
+            }]).to_csv("interpolation_summary.csv", index=False)
+
+    sol = run_simulation(BASELINE)
+    consistency = None
+    if sol is not None:
+        res = extract_results(sol, BASELINE)
+        consistency = analyze_consistency(res)
+        if consistency is not None:
+            pd.DataFrame({
+                "N": consistency["N"],
+                "eps_H": consistency["eps_H"],
+            }).to_csv("expansion_consistency.csv", index=False)
+            plot_consistency(consistency)
+
+    grid_df = test_diagnostic_grid_sampling(BASELINE)
+    grid_df.to_csv("diagnostic_grid_sampling.csv", index=False)
+
+    lcdm = test_lambdacdm_limit()
+    if lcdm is not None:
+        pd.DataFrame({
+            "z": lcdm["res"]["z"],
+            "H_model_norm": lcdm["H_model_norm"],
+            "E_LCDM": lcdm["E_LCDM"],
+            "relative_shape_deviation": np.abs(
+                lcdm["H_model_norm"] - lcdm["E_LCDM"]
+            ) / lcdm["E_LCDM"],
+        }).to_csv("lambdacdm_comparison.csv", index=False)
+        pd.DataFrame([{
+            "H0_abs_deviation": lcdm["H0_abs_deviation"],
+            "max_shape_deviation": lcdm["max_shape_deviation"],
+            "Omega_m0_deviation": lcdm["Omega_m0_deviation"],
+            "Omega_Lambda0_deviation": lcdm["Omega_Lambda0_deviation"],
+            "w_eff0_deviation": lcdm["w_eff0_deviation"],
+            "field_zero_error": lcdm["field_zero_error"],
+            "H0_pass": lcdm["H0_pass"],
+            "shape_pass": lcdm["shape_pass"],
+            "Omega_m0_pass": lcdm["Omega_m0_pass"],
+            "Omega_Lambda0_pass": lcdm["Omega_Lambda0_pass"],
+            "w_eff0_pass": lcdm["w_eff0_pass"],
+            "field_zero_pass": lcdm["field_zero_pass"],
+            "overall_lcdm_pass": lcdm["overall_lcdm_pass"],
+        }]).to_csv("lambdacdm_summary.csv", index=False)
+
+    if sol is not None:
+        res = extract_results(sol, BASELINE)
+        eps_clock = compute_clock_tolerance(
+            res["x_dot"], res["H"], res["idx_min"]
+        )
+        min_val = res["min_info"]["H_x_dot"]
+        classification = classify_clock(
+            min_val, res["zero_crossings"], eps_clock
+        )
+        pd.DataFrame([{
+            **res["present_day"],
+            "zero_crossings": res["zero_crossings"],
+            "min_Hxdot": min_val,
+            "min_N": res["min_info"]["N"],
+            "min_z": res["min_info"]["z"],
+            "eps_clock": eps_clock,
+            "classification": classification,
+        }]).to_csv("baseline_summary.csv", index=False)
+        np.savez(
+            "baseline_data.npz",
+            N=res["N"], z=res["z"], x=res["x"], x_dot=res["x_dot"],
+            y=res["y"], y_dot=res["y_dot"], H=res["H"], H2=res["H2"],
+            Omega_m=res["Omega_m"], Omega_r=res["Omega_r"],
+            Omega_tau=res["Omega_tau"], Omega_chi=res["Omega_chi"],
+            Omega_Lambda=res["Omega_Lambda"], w_eff=res["w_eff"],
+            clock_derivative=res["clock_derivative"], eps_H=res["eps_H"],
+            H_N_over_H_acc=res["H_N_over_H_acc"],
+            H_N_over_H_num=res["H_N_over_H_num"],
+        )
+        plot_clock_derivative(res)
+
+    print("Validation run complete. Outputs saved to the current directory.")
+    return conv_df, interp, consistency, lcdm, grid_df
+
+
+if __name__ == "__main__":
+    run_full_validation()
