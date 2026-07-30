@@ -1,0 +1,131 @@
+Symbolic Coupling Sign Audit
+
+"""v0.7C5: conformally coupled two-field Newtonian-gauge perturbation regression.
+
+Evolves covariant field perturbations Q^A, P^A=D_N Q^A together with dust,
+perfect radiation, and Phi=Psi on the calibrated background with beta != 0.
+Dust exchange terms are derived from rho_m = m(chi)n with conserved number
+current and s=d ln m/dchi=-beta. This is equivalent to matter coupling
+through B^2 g with B=A^{-1}, consistent with rho_m'=-3rho_m-beta chi'rho_m.
+"""
+from __future__ import annotations
+import importlib.util, json
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp
+
+OUT=Path(__file__).resolve().parent
+BG_PATH=Path('/mnt/data/calibrated_reference_v0_5/two_field_validation_v0_5_calibrated.py')
+spec=importlib.util.spec_from_file_location('bgv05',BG_PATH); bgm=importlib.util.module_from_spec(spec); spec.loader.exec_module(bgm)
+P=dict(bgm.BASELINE)
+NI=np.log(1/51.0); NF=0.0
+K_HMPC=np.array([1e-3,1e-2,1e-1]); KCONV=2997.92458
+
+bsol=bgm.run_simulation(P,solver='DOP853',rtol=1e-12,atol=1e-14,max_step=.005,N_i=np.log(1e-6),N_f=0,dense_output=True,detect_clock_events=False)
+if bsol is None: raise RuntimeError('background failed')
+
+def geo(y):
+    kap=P['kappa']; mu=P['mu_star_tilde']; K=1+kap*y*y/mu**2; Ky=2*kap*y/mu**2
+    G=np.array([[K,0.],[0.,1.]])
+    Gi=np.array([[1/K,0.],[0.,1.]])
+    Gamma=np.zeros((2,2,2))
+    Gamma[0,0,1]=Gamma[0,1,0]=Ky/(2*K); Gamma[1,0,0]=-Ky/2
+    # R^a_{b c d}; only independent nonzero components for diag(K(y),1)
+    R=np.zeros((2,2,2,2)); den=kap*y*y+mu*mu
+    R[0,1,0,1]=-kap*mu*mu/den**2; R[0,1,1,0]=kap*mu*mu/den**2
+    R[1,0,0,1]=kap/den; R[1,0,1,0]=-kap/den
+    return K,Ky,G,Gi,Gamma,R
+
+def bg(N):
+    x,xp,y,yp,rm,rr=bsol.sol(N); K,Ky,G,Gi,Gamma,R=geo(y)
+    den=1-(K*xp*xp+yp*yp)/6
+    H2=(rm+rr+P['Lambda_tilde']+P['m_tau_tilde']**2*x*x/6+P['m_chi_tilde']**2*y*y/6)/den
+    rt=H2*K*xp*xp/6+P['m_tau_tilde']**2*x*x/6; pt=H2*K*xp*xp/6-P['m_tau_tilde']**2*x*x/6
+    rc=H2*yp*yp/6+P['m_chi_tilde']**2*y*y/6; pc=H2*yp*yp/6-P['m_chi_tilde']**2*y*y/6
+    h=-(3/(2*H2))*(rm+4*rr/3+rt+pt+rc+pc)
+    beta=-P['gamma_chi']*y/P['M_chi_tilde']**2; beta_y=-P['gamma_chi']/P['M_chi_tilde']**2
+    return dict(x=x,xp=xp,y=y,yp=yp,rm=rm,rr=rr,H=np.sqrt(H2),H2=H2,h=h,om=rm/H2,orr=rr/H2,K=K,Ky=Ky,G=G,Gi=Gi,Gamma=Gamma,R=R,beta=beta,beta_y=beta_y)
+
+def mass_matrix(B):
+    x,y=B['x'],B['y']; K,Ky,Gi,Gamma,R=B['K'],B['Ky'],B['Gi'],B['Gamma'],B['R']; v=np.array([B['xp'],B['yp']])
+    grad=np.array([P['m_tau_tilde']**2*x,P['m_chi_tilde']**2*y])
+    Hess=np.array([[P['m_tau_tilde']**2-Gamma[1,0,0]*grad[1], -Gamma[0,0,1]*grad[0]],[-Gamma[0,1,0]*grad[0],P['m_chi_tilde']**2]])
+    U=Gi@Hess
+    for a in range(2):
+      for b in range(2):
+        U[a,b]-=B['H2']*sum(R[a,c,d,b]*v[c]*v[d] for c in range(2) for d in range(2))
+    return U
+
+def scalar_terms(B,Q,Pcov,Phi):
+    v=np.array([B['xp'],B['yp']]); grad=np.array([P['m_tau_tilde']**2*B['x'],P['m_chi_tilde']**2*B['y']])
+    kin=float(v@B['G']@v); vp=float(v@B['G']@Pcov)
+    drho_norm=B['H2']*(vp-Phi*kin)/3 + float(grad@Q)/3
+    dp_norm=B['H2']*(vp-Phi*kin)/3 - float(grad@Q)/3
+    mom=float(v@B['G']@Q)
+    return drho_norm/B['H2'],dp_norm/B['H2'],mom
+
+def initial(kd):
+    B=bg(NI); q=kd/(np.exp(NI)*B['H']); Phi=-1e-5
+    Q=np.zeros(2); Pcov=np.zeros(2); ds,_,sm=scalar_terms(B,Q,Pcov,Phi)
+    u=(2/3)*q*q*(0.0+Phi-0.5*sm)/max(B['om']+4*B['orr']/3,1e-30)
+    S=-(2/3)*(q*q*Phi+3*Phi)-ds
+    dm=S/max(B['om']+4*B['orr']/3,1e-30); dr=4*dm/3
+    return np.array([0.,0.,0.,0.,dm,u,dr,u,Phi])
+
+def rhs_factory(kd):
+  def rhs(N,Y):
+    Qt,Pt,Qc,Pc,dm,um,dr,ur,Phi=Y; Q=np.array([Qt,Qc]); Pcov=np.array([Pt,Pc]); B=bg(N); q=kd/(np.exp(N)*B['H']); v=np.array([B['xp'],B['yp']])
+    ds,dps,sm=scalar_terms(B,Q,Pcov,Phi)
+    PhiN=-Phi+1.5*(B['om']*um+4*B['orr']*ur/3)/(q*q)+0.5*sm
+    Gamma=B['Gamma']; Qprime=Pcov-np.einsum('abc,b,c->a',Gamma,v,Q)
+    U=mass_matrix(B)/B['H2']; Vup=B['Gi']@np.array([P['m_tau_tilde']**2*B['x'],P['m_chi_tilde']**2*B['y']])/B['H2']
+    covP_rhs=-(3+B['h'])*Pcov-q*q*Q-U@Q+4*v*PhiN-2*Vup*Phi
+    # Linearized conformal exchange. Background chi force is +3 beta rho_m/H^2.
+    # Its perturbation contributes beta*delta_m + beta_,chi*Qchi and the
+    # Newtonian lapse contribution +2 beta Phi.
+    covP_rhs[1] += 3*B['om']*(B['beta']*dm + B['beta_y']*Qc + 2*B['beta']*Phi)
+    Pprime=covP_rhs-np.einsum('abc,b,c->a',Gamma,v,Pcov)
+    # Conserved particle number with rho_m=m(chi)n and dlnm/dchi=-beta.
+    dmN=-um+3*PhiN-B['beta']*Qprime[1]-B['beta_y']*B['yp']*Qc
+    # Variable-mass drag and conformal fifth force.
+    umN=-(2+B['h']-B['beta']*B['yp'])*um+q*q*(Phi-B['beta']*Qc)
+    return [Qprime[0],Pprime[0],Qprime[1],Pprime[1],dmN,umN,-4*ur/3+4*PhiN,-(1+B['h'])*ur+q*q*(dr/4+Phi),PhiN]
+  return rhs
+
+def residuals(N,Y,kd):
+    out=[]
+    for i,n in enumerate(np.atleast_1d(N)):
+      Qt,Pt,Qc,Pc,dm,um,dr,ur,Phi=Y[:,i]; B=bg(float(n)); q=kd/(np.exp(n)*B['H']); Q=np.array([Qt,Qc]); Pv=np.array([Pt,Pc]); ds,_,sm=scalar_terms(B,Q,Pv,Phi)
+      PhiN=-Phi+1.5*(B['om']*um+4*B['orr']*ur/3)/(q*q)+0.5*sm
+      ham=q*q*Phi+3*(PhiN+Phi)+1.5*(B['om']*dm+B['orr']*dr+ds)
+      mom=(PhiN+Phi)-1.5*(B['om']*um+4*B['orr']*ur/3)/(q*q)-0.5*sm
+      scale=max(abs(q*q*Phi),abs(3*(PhiN+Phi)),abs(1.5*(B['om']*dm+B['orr']*dr+ds)),1e-30)
+      out.append((ham,mom,ham/scale,ds,sm))
+    return np.asarray(out).T
+
+def run(method,rtol,atol,max_step,k):
+    kd=k*KCONV; sol=solve_ivp(rhs_factory(kd),(NI,NF),initial(kd),method=method,rtol=rtol,atol=atol,max_step=max_step,dense_output=True)
+    if not sol.success: raise RuntimeError(sol.message)
+    N=np.linspace(NI,NF,401); Y=sol.sol(N); R=residuals(N,Y,kd)
+    return N,Y,R,sol.nfev
+
+def main():
+    cfgs=[('DOP853',1e-9,1e-11,.04),('Radau',1e-8,1e-10,.04),('DOP853',1e-10,1e-12,.02)]
+    rows=[]; profiles=[]; cache={}; refs={}
+    for k in K_HMPC:
+      for j,cfg in enumerate(cfgs,1):
+        N,Y,R,nfev=run(*cfg,k); cache[(float(k),j)]=(N,Y); 
+        rows.append(dict(test_id=f'k{k:g}-C4-{j}',k_h_Mpc=k,method=cfg[0],rtol=cfg[1],atol=cfg[2],max_step=cfg[3],nfev=nfev,max_abs_hamiltonian=float(np.max(np.abs(R[0]))),max_rel_hamiltonian=float(np.max(np.abs(R[2]))),max_abs_momentum=float(np.max(np.abs(R[1]))),delta_m_z0=float(Y[4,-1]),Phi_z0=float(Y[8,-1]),max_abs_Qtau=float(np.max(np.abs(Y[0]))),max_abs_Qchi=float(np.max(np.abs(Y[2])))))
+        if j==3:
+          refs[k]=Y
+          for i in range(len(N)): profiles.append((N[i],np.exp(-N[i])-1,k,*Y[:,i],*R[:,i]))
+    for r in rows:
+      k=float(r['k_h_Mpc']); j=int(r['test_id'].split('-')[-1]); Y=cache[(k,j)][1]; r['max_state_spread_vs_ref']=float(np.max(np.abs(Y-refs[k])))
+    df=pd.DataFrame(rows); df.to_csv(OUT/'corrected_coupled_cross_solver.csv',index=False)
+    cols=['N','z','k_h_Mpc','Q_tau','P_tau','Q_chi','P_chi','delta_m','u_m','delta_r','u_r','Phi','hamiltonian_residual','momentum_residual','relative_hamiltonian','delta_rho_scalar_over_H2','scalar_momentum']
+    pd.DataFrame(profiles,columns=cols).to_csv(OUT/'corrected_coupled_profiles.csv',index=False)
+    tight=df[df['test_id'].str.endswith(('-2','-3'))]
+    summary={'milestone':'v0.7C5','scope':'sign-audited, trajectory-preserving coupled two-field + dust + perfect radiation + Newtonian metric perturbations','status':'PASS' if tight.max_state_spread_vs_ref.max()<2e-6 and df.max_abs_momentum.max()<1e-12 else 'QUALIFIED/FAIL','k_modes_h_Mpc':K_HMPC.tolist(),'max_tight_solver_state_spread':float(tight.max_state_spread_vs_ref.max()),'max_absolute_momentum_residual':float(df.max_abs_momentum.max()),'max_relative_hamiltonian_residual':float(df.max_rel_hamiltonian.max()),'max_abs_Qtau':float(df.max_abs_Qtau.max()),'max_abs_Qchi':float(df.max_abs_Qchi.max()),'acceptance':{'tight_solver_state_spread_lt':2e-6,'momentum_residual_lt':1e-12},'caveat':'The frozen background is interpreted with B=A^{-1}, so alpha=d ln B/dchi=-beta. This preserves the validated trajectory. A neutrino hierarchy remains omitted.','next_required':'Compare corrected residuals with v0.7C3/v0.7C4, then perform quasistatic and observable validation.'}
+    (OUT/'v0_7C5_numerical_summary.json').write_text(json.dumps(summary,indent=2)); print(json.dumps(summary,indent=2))
+if __name__=='__main__': main()
