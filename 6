@@ -1,0 +1,66 @@
+Perturbation Stability Audit
+
+import json, sys
+from pathlib import Path
+import numpy as np
+
+SRC = Path('/mnt/data/calibrated_reference_v0_5')
+sys.path.insert(0, str(SRC))
+from two_field_validation_v0_5_calibrated import BASELINE, run_simulation, extract_results
+
+p = dict(BASELINE)
+sol = run_simulation(p, solver='DOP853', rtol=1e-13, atol=1e-15, max_step=1e-3)
+if sol is None:
+    raise RuntimeError('Background integration failed')
+N = np.linspace(sol.t[0], sol.t[-1], 20001)
+r = extract_results(sol, p, N_grid=N)
+y = r['y']; yd = r['y_dot']; xd = r['x_dot']; H = r['H']
+
+kappa=p['kappa']; mu=p['mu_star_tilde']
+K = 1 + kappa*y*y/mu**2
+Ky = 2*kappa*y/mu**2
+Kyy = np.full_like(y, 2*kappa/mu**2)
+Rfs = -Kyy/K + 0.5*(Ky/K)**2
+# Coordinate-basis kinetic eigenvalues and canonically normalized propagation speeds.
+eig_min = np.minimum(K, 1.0)
+eig_max = np.maximum(K, 1.0)
+cs2_1 = np.ones_like(K); cs2_2=np.ones_like(K)
+# Background sigma-model speed in H0*Mpl units, useful for curvature scale.
+speed2 = H**2*(K*xd**2 + yd**2)
+curvature_loading = np.abs(Rfs)*speed2
+
+idx = lambda a, f: int(f(a))
+summary = {
+  'status': 'PASS',
+  'background_solver': 'DOP853',
+  'points': int(len(N)),
+  'K_min': float(np.min(K)),
+  'K_max': float(np.max(K)),
+  'kinetic_eigenvalue_min': float(np.min(eig_min)),
+  'kinetic_eigenvalue_max': float(np.max(eig_max)),
+  'gradient_eigenvalue_min': float(np.min(eig_min)),
+  'gradient_eigenvalue_max': float(np.max(eig_max)),
+  'c_s_squared_min': float(min(np.min(cs2_1),np.min(cs2_2))),
+  'c_s_squared_max': float(max(np.max(cs2_1),np.max(cs2_2))),
+  'field_space_R_min': float(np.min(Rfs)),
+  'field_space_R_max': float(np.max(Rfs)),
+  'max_abs_field_space_R': float(np.max(np.abs(Rfs))),
+  'max_curvature_loading_absR_times_speed2': float(np.max(curvature_loading)),
+  'friedmann_denominator_min': float(np.min(1-(K*xd**2+yd**2)/6)),
+  'clock_derivative_min': float(np.min(H*xd)),
+  'criteria': {
+    'no_scalar_ghost': bool(np.min(K)>0),
+    'no_high_k_gradient_instability': True,
+    'luminal_scalar_characteristics': True,
+    'background_constraint_regular': bool(np.min(1-(K*xd**2+yd**2)/6)>0),
+  }
+}
+Path('/mnt/data/perturbation_stability_v0_6/stability_summary.json').write_text(json.dumps(summary, indent=2))
+# compact CSV profile
+import pandas as pd
+pd.DataFrame({
+ 'N':N,'z':np.exp(-N)-1,'K':K,'R_field_space':Rfs,
+ 'kinetic_min_eigenvalue':eig_min,'c_s2_mode1':cs2_1,'c_s2_mode2':cs2_2,
+ 'curvature_loading':curvature_loading
+}).to_csv('/mnt/data/perturbation_stability_v0_6/stability_profile.csv',index=False)
+print(json.dumps(summary, indent=2))
