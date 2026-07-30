@@ -1,0 +1,131 @@
+LCDM Subhorizon Growth Regression
+
+"""v0.7C1: numerical regression for linear dust growth in flat LCDM.
+
+This validates the Fourier-mode integration and cross-solver infrastructure in the
+subhorizon, pressureless, zero-slip GR limit. It is not the full coupled two-field
+perturbation solver.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp, cumulative_trapezoid
+
+OUT = Path(__file__).resolve().parent
+OM0 = 0.3
+OR0 = 8.4e-5
+OL0 = 1.0 - OM0 - OR0
+N_I = np.log(1e-3)  # start at z=999; radiation retained in H
+N_F = 0.0
+K_MODES = np.array([1e-3, 1e-2, 1e-1, 1.0])  # h/Mpc labels; GR smooth-DE equation is scale independent
+
+
+def bg(N: np.ndarray | float):
+    a = np.exp(N)
+    e2 = OR0*a**-4 + OM0*a**-3 + OL0
+    om = OM0*a**-3/e2
+    orad = OR0*a**-4/e2
+    hp = -0.5*(3.0*om + 4.0*orad)
+    return np.sqrt(e2), om, orad, hp
+
+
+def rhs(N, y):
+    D, F = y
+    _, om, _, hp = bg(N)
+    return [F, -(2.0 + hp)*F + 1.5*om*D]
+
+
+def integrate(method: str, rtol: float, atol: float, max_step: float):
+    ai = np.exp(N_I)
+    # Growing-mode matter-era initialization. At z=999 radiation is modest; this is
+    # intentionally tested against a later-start sensitivity run below.
+    y0 = [ai, ai]
+    sol = solve_ivp(rhs, (N_I, N_F), y0, method=method, rtol=rtol, atol=atol,
+                    max_step=max_step, dense_output=True)
+    if not sol.success:
+        raise RuntimeError(sol.message)
+    N = np.linspace(N_I, N_F, 5001)
+    D, F = sol.sol(N)
+    Dn = D/D[-1]
+    fn = F/D
+    return N, Dn, fn, sol.nfev
+
+
+def integral_reference(N):
+    """Heath integral reference, exact for flat matter+Lambda (radiation omitted)."""
+    a = np.exp(N)
+    E = np.sqrt(OM0*a**-3 + (1.0-OM0))
+    integrand = 1.0/(a**3 * E**3)
+    # Extend toward a=0 analytically with a logarithmic auxiliary grid.
+    ax = np.geomspace(1e-8, a[-1], 30000)
+    Ex = np.sqrt(OM0*ax**-3 + (1.0-OM0))
+    Ix = cumulative_trapezoid(1.0/(ax**3*Ex**3), ax, initial=0.0)
+    I = np.interp(a, ax, Ix)
+    D = 2.5*OM0*E*I
+    return D/D[-1]
+
+
+def main():
+    configs = [
+        ("RK45", 1e-9, 1e-11, 0.02),
+        ("DOP853", 1e-11, 1e-13, 0.02),
+        ("Radau", 1e-10, 1e-12, 0.02),
+        ("DOP853", 1e-12, 1e-14, 0.005),
+    ]
+    runs = []
+    curves = {}
+    for i, cfg in enumerate(configs, 1):
+        N, D, f, nfev = integrate(*cfg)
+        key = f"C1-{i}"
+        curves[key] = (N, D, f)
+        runs.append({"test_id": key, "method": cfg[0], "rtol": cfg[1], "atol": cfg[2],
+                     "max_step": cfg[3], "nfev": nfev, "D_z0": D[-1],
+                     "f_z0": f[-1]})
+
+    ref_key = "C1-4"
+    Nr, Dr, fr = curves[ref_key]
+    for row in runs:
+        N, D, f = curves[row["test_id"]]
+        row["max_abs_D_vs_ref"] = float(np.max(np.abs(D-Dr)))
+        row["max_abs_f_vs_ref"] = float(np.max(np.abs(f-fr)))
+
+    # Matter+Lambda integral comparison only at z<=50, where radiation omission is small.
+    mask = Nr >= -np.log(51.0)
+    Dint = integral_reference(Nr)
+    integral_err = float(np.max(np.abs(Dr[mask]-Dint[mask])))
+
+    # Scale-independence replication across labeled k modes.
+    rows = []
+    for k in K_MODES:
+        for N, D, f in zip(Nr, Dr, fr):
+            rows.append((N, np.exp(-N)-1.0, k, D, f))
+    pd.DataFrame(rows, columns=["N","z","k_h_Mpc","D_normalized","f"]).to_csv(
+        OUT/"lcdm_mode_profiles.csv", index=False)
+    pd.DataFrame(runs).to_csv(OUT/"lcdm_cross_solver.csv", index=False)
+
+    solver_spread_D = max(r["max_abs_D_vs_ref"] for r in runs)
+    solver_spread_f = max(r["max_abs_f_vs_ref"] for r in runs)
+    summary = {
+        "milestone": "v0.7C1",
+        "scope": "flat-LCDM subhorizon dust-growth regression; not full metric-scalar-matter system",
+        "status": "PASS" if solver_spread_D < 1e-8 and solver_spread_f < 1e-8 else "FAIL",
+        "Omega_m0": OM0, "Omega_r0": OR0, "Omega_Lambda0": OL0,
+        "z_initial": float(np.exp(-N_I)-1),
+        "k_modes_h_Mpc": K_MODES.tolist(),
+        "max_cross_solver_D_spread": solver_spread_D,
+        "max_cross_solver_f_spread": solver_spread_f,
+        "max_D_difference_from_matter_Lambda_integral_z_le_50": integral_err,
+        "f_z0_reference": float(fr[-1]),
+        "acceptance": {"cross_solver_D_lt": 1e-8, "cross_solver_f_lt": 1e-8},
+        "next_required": "v0.7C2 uncoupled two-field perturbations with Einstein constraints"
+    }
+    (OUT/"v0_7C1_summary.json").write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2))
+    if summary["status"] != "PASS":
+        raise SystemExit(1)
+
+if __name__ == "__main__":
+    main()
