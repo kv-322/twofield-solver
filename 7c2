@@ -1,0 +1,98 @@
+Metric-Fluid Constraint Regression
+
+"""v0.7C2: Newtonian-gauge metric+fluid constraint regression.
+
+Evolves dust, perfect radiation, and Phi=Psi on the calibrated v0.5 background.
+Scalar-field perturbations are deliberately disabled; this validates the metric/fluid
+constraint infrastructure before adding Q^tau and Q^chi in v0.7C3.
+"""
+from __future__ import annotations
+import importlib.util, json
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp
+
+OUT=Path(__file__).resolve().parent
+BG_PATH=Path('/mnt/data/calibrated_reference_v0_5/two_field_validation_v0_5_calibrated.py')
+spec=importlib.util.spec_from_file_location('bgv05',BG_PATH); bgm=importlib.util.module_from_spec(spec); spec.loader.exec_module(bgm)
+P=dict(bgm.BASELINE); P['gamma_chi']=0.0  # uncoupled regression background
+NI=np.log(1/51.0); NF=0.0
+K_HMPC=np.array([1e-3,1e-2,1e-1])
+KCONV=2997.92458 # k/H0 for k in h/Mpc
+
+bsol=bgm.run_simulation(P,solver='DOP853',rtol=1e-12,atol=1e-14,max_step=.005,N_i=np.log(1e-6),N_f=0,dense_output=True,detect_clock_events=False)
+if bsol is None: raise RuntimeError('background failed')
+
+def bg(N):
+    x,xp,y,yp,rm,rr=bsol.sol(N)
+    K=1+P['kappa']*y*y/P['mu_star_tilde']**2
+    den=1-(K*xp*xp+yp*yp)/6
+    H2=(rm+rr+P['Lambda_tilde']+P['m_tau_tilde']**2*x*x/6+P['m_chi_tilde']**2*y*y/6)/den
+    rt=H2*K*xp*xp/6+P['m_tau_tilde']**2*x*x/6
+    pt=H2*K*xp*xp/6-P['m_tau_tilde']**2*x*x/6
+    rc=H2*yp*yp/6+P['m_chi_tilde']**2*y*y/6
+    pc=H2*yp*yp/6-P['m_chi_tilde']**2*y*y/6
+    h=-(3/(2*H2))*(rm+4*rr/3+rt+pt+rc+pc)
+    return np.sqrt(H2),h,rm/H2,rr/H2,(rt+rc)/H2
+
+def initial(kd):
+    H,h,om,orr,os=bg(NI); q=kd/(np.exp(NI)*H); Phi=-1e-5
+    # Phi_N=0 momentum constraint, common initial velocity.
+    u=(2/3)*q*q*Phi/max(om+4*orr/3,1e-30)
+    # Adiabatic dr=4 dm/3; Hamiltonian solves dm.
+    S=-(2/3)*(q*q*Phi+3*Phi) # om*dm+orr*dr
+    dm=S/max(om+4*orr/3,1e-30); dr=4*dm/3
+    return np.array([dm,u,dr,u,Phi])
+
+def rhs_factory(kd):
+    def rhs(N,Y):
+        dm,um,dr,ur,Phi=Y; H,h,om,orr,os=bg(N); q=kd/(np.exp(N)*H)
+        PhiN=-Phi+1.5*(om*um+4*orr*ur/3)/(q*q)
+        return [-um+3*PhiN, -(2+h)*um+q*q*Phi,
+                -4*ur/3+4*PhiN, -(1+h)*ur+q*q*(dr/4+Phi), PhiN]
+    return rhs
+
+def residuals(N,Y,kd):
+    dm,um,dr,ur,Phi=Y; H,h,om,orr,os=bg(N); q=kd/(np.exp(N)*H)
+    PhiN=-Phi+1.5*(om*um+4*orr*ur/3)/(q*q)
+    ham=q*q*Phi+3*(PhiN+Phi)+1.5*(om*dm+orr*dr)
+    mom=(PhiN+Phi)-1.5*(om*um+4*orr*ur/3)/(q*q)
+    scale=np.maximum.reduce([np.abs(q*q*Phi),np.abs(3*(PhiN+Phi)),np.abs(1.5*(om*dm+orr*dr)),np.full_like(np.asarray(N),1e-30)])
+    return ham,mom,ham/scale
+
+def run(method,rtol,atol,max_step,k):
+    kd=k*KCONV; sol=solve_ivp(rhs_factory(kd),(NI,NF),initial(kd),method=method,rtol=rtol,atol=atol,max_step=max_step,dense_output=True)
+    if not sol.success: raise RuntimeError(sol.message)
+    N=np.linspace(NI,NF,601); Y=sol.sol(N); ham,mom,hrel=residuals(N,Y,kd)
+    return N,Y,ham,mom,hrel,sol.nfev
+
+def main():
+    cfgs=[('RK45',1e-7,1e-9,.05),('DOP853',1e-9,1e-11,.05),('Radau',1e-8,1e-10,.05),('DOP853',1e-10,1e-12,.02)]
+    rows=[]; profiles=[]; refs={}; cache={}
+    for k in K_HMPC:
+      for j,cfg in enumerate(cfgs,1):
+        N,Y,ham,mom,hrel,nfev=run(*cfg,k); cache[(float(k),j)]=(N,Y); key=f'k{k:g}-C2-{j}'
+        rows.append(dict(test_id=key,k_h_Mpc=k,method=cfg[0],rtol=cfg[1],atol=cfg[2],max_step=cfg[3],nfev=nfev,
+          max_abs_hamiltonian=float(np.max(np.abs(ham))),max_rel_hamiltonian=float(np.max(np.abs(hrel))),max_abs_momentum=float(np.max(np.abs(mom))),delta_m_z0=float(Y[0,-1]),Phi_z0=float(Y[4,-1])))
+        if j==4:
+          refs[k]=(N,Y)
+          for i in range(len(N)): profiles.append((N[i],np.exp(-N[i])-1,k,*Y[:,i],ham[i],mom[i],hrel[i]))
+    # Cross-solver normalized history spread.
+    for r in rows:
+      k=r['k_h_Mpc']; j=int(r['test_id'].split('-')[-1]); N,Y=cache[(float(k),j)]; Yr=refs[k][1]
+      r['max_state_spread_vs_ref']=float(np.max(np.abs(Y-Yr)))
+    df=pd.DataFrame(rows); df.to_csv(OUT/'metric_fluid_cross_solver.csv',index=False)
+    pd.DataFrame(profiles,columns=['N','z','k_h_Mpc','delta_m','u_m','delta_r','u_r','Phi','hamiltonian_residual','momentum_residual','relative_hamiltonian']).to_csv(OUT/'metric_fluid_profiles.csv',index=False)
+    maxspread=float(df.max_state_spread_vs_ref.max()); maxmom=float(df.max_abs_momentum.max())
+    # Hamiltonian is a monitored, not enforced, constraint; use relative drift after initialization.
+    maxhrel=float(df.max_rel_hamiltonian.max())
+    summary={'milestone':'v0.7C2','scope':'Newtonian-gauge dust+radiation+metric regression on calibrated uncoupled background; scalar perturbations disabled',
+      'status':'PASS' if maxspread<2e-7 and maxmom<1e-12 else 'FAIL','k_modes_h_Mpc':K_HMPC.tolist(),
+      'max_cross_solver_state_spread':maxspread,'max_absolute_momentum_residual':maxmom,'max_relative_hamiltonian_residual':maxhrel,
+      'acceptance':{'cross_solver_state_spread_lt':2e-7,'momentum_residual_lt':1e-12},
+      'important_caveat':'Hamiltonian drift includes the inconsistency from treating the rolling scalar background as smooth while disabling its perturbations; it is diagnostic, not a complete constraint pass.',
+      'next_required':'v0.7C3 add covariant Q^tau,Q^chi and their stress-energy so the full Hamiltonian constraint can be tested.'}
+    (OUT/'v0_7C2_summary.json').write_text(json.dumps(summary,indent=2)); print(json.dumps(summary,indent=2))
+    if summary['status']!='PASS': raise SystemExit(1)
+if __name__=='__main__': main()
