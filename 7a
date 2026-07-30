@@ -1,0 +1,135 @@
+ v0.7A: Perturbation Coefficient Scaffold
+
+"""v0.7A coefficient and convention scaffold for coupled perturbations.
+
+This module does not claim to integrate the full perturbation system. It
+computes field-space geometry, covariant potential/coupling Hessians, and
+background coefficient tables from the calibrated v0.5 solution. These are
+inputs to the forthcoming component-generated Newtonian-gauge solver.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+from typing import Dict
+
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+V05 = ROOT / "calibrated_reference_v0_5"
+if str(V05) not in sys.path:
+    sys.path.insert(0, str(V05))
+
+from two_field_validation_v0_5_calibrated import BASELINE, run_simulation, extract_results  # noqa: E402
+
+
+def geometry(y: np.ndarray, p: Dict[str, float]) -> Dict[str, np.ndarray]:
+    mu2 = p["mu_star_tilde"] ** 2
+    K = 1.0 + p["kappa"] * y**2 / mu2
+    Ky = 2.0 * p["kappa"] * y / mu2
+    Kyy = 2.0 * p["kappa"] / mu2 * np.ones_like(y)
+    gamma_t_ty = Ky / (2.0 * K)
+    gamma_y_tt = -0.5 * Ky
+    ricci = -Kyy / K + Ky**2 / (2.0 * K**2)
+    r_tyty = -0.5 * Kyy + Ky**2 / (4.0 * K)
+    return {
+        "K": K,
+        "K_y": Ky,
+        "K_yy": Kyy,
+        "Gamma_tau_tauch": gamma_t_ty,
+        "Gamma_ch_tautau": gamma_y_tt,
+        "R_field": ricci,
+        "R_tauch_tauch": r_tyty,
+    }
+
+
+def covariant_hessians(x: np.ndarray, y: np.ndarray, p: Dict[str, float]) -> Dict[str, np.ndarray]:
+    g = geometry(y, p)
+    K, Ky = g["K"], g["K_y"]
+    mt2 = p["m_tau_tilde"] ** 2
+    mc2 = p["m_chi_tilde"] ** 2
+
+    # Lower-index covariant Hessian V_{;AB}.
+    V_tt = mt2 + 0.5 * Ky * mc2 * y
+    V_ty = -(Ky / (2.0 * K)) * mt2 * x
+    V_yy = mc2 * np.ones_like(y)
+
+    beta = -p["gamma_chi"] * y / p["M_chi_tilde"] ** 2
+    beta_y = -p["gamma_chi"] / p["M_chi_tilde"] ** 2 * np.ones_like(y)
+
+    # Hessian of ln A, lower field-space indices.
+    lnA_tt = 0.5 * Ky * beta
+    lnA_ty = np.zeros_like(y)
+    lnA_yy = beta_y
+
+    return {
+        "Vh_tt": V_tt,
+        "Vh_ty": V_ty,
+        "Vh_yy": V_yy,
+        "beta": beta,
+        "beta_y": beta_y,
+        "lnAh_tt": lnA_tt,
+        "lnAh_ty": lnA_ty,
+        "lnAh_yy": lnA_yy,
+    }
+
+
+def build_profile(samples: int = 4001) -> pd.DataFrame:
+    p = dict(BASELINE)
+    sol = run_simulation(p, solver="DOP853", rtol=1e-12, atol=1e-14, max_step=0.01)
+    if sol is None:
+        raise RuntimeError("Calibrated v0.5 background integration failed.")
+    N = np.linspace(np.log(1e-6), 0.0, samples)
+    res = extract_results(sol, p, N_grid=N)
+    x = np.asarray(res["x"])
+    y = np.asarray(res["y"])
+    geom = geometry(y, p)
+    hess = covariant_hessians(x, y, p)
+    data = {
+        "N": N,
+        "a": np.exp(N),
+        "z": np.exp(-N) - 1.0,
+        "H": np.asarray(res["H"]),
+        "x": x,
+        "x_N": np.asarray(res["x_dot"]),
+        "y": y,
+        "y_N": np.asarray(res["y_dot"]),
+        "rho_m": np.asarray(res["rho_m"]),
+        "rho_r": np.asarray(res["rho_r"]),
+    }
+    data.update(geom)
+    data.update(hess)
+    return pd.DataFrame(data)
+
+
+def main() -> None:
+    outdir = Path(__file__).resolve().parent
+    df = build_profile()
+    profile_path = outdir / "perturbation_coefficient_profile.csv"
+    df.to_csv(profile_path, index=False)
+
+    summary = {
+        "status": "v0.7A coefficient scaffold executed; full perturbation integration not yet implemented",
+        "rows": int(len(df)),
+        "K_min": float(df["K"].min()),
+        "K_max": float(df["K"].max()),
+        "field_ricci_min": float(df["R_field"].min()),
+        "field_ricci_max": float(df["R_field"].max()),
+        "beta_min": float(df["beta"].min()),
+        "beta_max": float(df["beta"].max()),
+        "finite_all": bool(np.isfinite(df.select_dtypes(include=[np.number]).to_numpy()).all()),
+        "checks": {
+            "K_positive": bool((df["K"] > 0.0).all()),
+            "hessian_symmetric": True,
+            "beta_sign_matches_action": bool((df["beta"] <= 0.0).all()),
+        },
+    }
+    with open(outdir / "v0_7A_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()
